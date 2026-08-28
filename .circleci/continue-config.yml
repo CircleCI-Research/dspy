@@ -1,0 +1,718 @@
+# CircleCI continuation (second-stage) config for dspy.
+#
+# Sources ported here:
+#   .github/workflows/run_tests.yml        -> workflows `core`
+#   .github/workflows/dependency-range.yml -> workflow  `dependencies`
+#   .github/workflows/docs-push.yml        -> workflow  `docs` (build-test job only)
+#   .github/workflows/precommits_check.yml -> workflow  `pre-commit`
+#
+# Deliberately NOT ported: .github/workflows/build_and_release.yml (PyPI
+# publishing) and docs-push.yml's `update-docs-subtree` job (pushes to another
+# GitHub repo). Both automate release/GitHub plumbing rather than verifying code.
+#
+# Environment variables this config expects to be provided by the CircleCI
+# project (none are needed for the `core`, `docs` or `dependencies` workflows):
+#   GITHUB_TOKEN  read-only token with `pull:read`, used only by the
+#                 `pre-commit-checks` job to fetch the pull request title.
+version: 2.1
+
+# ---------------------------------------------------------------------------
+# Pipeline parameters.
+#
+# CONTRACT: this set must match, name for name, the JSON object written by
+# .circleci/scripts/emit-pipeline-parameters.sh. CircleCI does not check this.
+# ---------------------------------------------------------------------------
+parameters:
+  run-core:
+    description: run_tests.yml equivalent (lint, tests, build).
+    type: boolean
+    default: true
+  run-docs:
+    description: docs-push.yml `build-test` equivalent. Set when docs/** changed.
+    type: boolean
+    default: false
+  run-deps:
+    description: dependency-range.yml equivalent.
+    type: boolean
+    default: false
+  run-pre-commit:
+    description: precommits_check.yml equivalent (manual dispatch only).
+    type: boolean
+    default: false
+  base-revision:
+    description: Branch pull requests are compared against.
+    type: string
+    default: main
+
+# ---------------------------------------------------------------------------
+# Reusable commands
+# ---------------------------------------------------------------------------
+commands:
+  install-uv:
+    description: >
+      Stand-in for astral-sh/setup-uv. The standalone installer plus an explicit
+      UV_CACHE_DIR replaces the action's `enable-cache`; the caching itself is
+      done with restore_cache/save_cache in each job, keyed on the same files
+      the action's `cache-dependency-glob` named.
+    parameters:
+      version:
+        description: uv version to install, or "latest".
+        type: string
+        default: latest
+    steps:
+      - run:
+          name: Install uv (<< parameters.version >>)
+          environment:
+            UV_VERSION: << parameters.version >>
+          command: |
+            if [ "$UV_VERSION" = "latest" ]; then
+              installer="https://astral.sh/uv/install.sh"
+            else
+              installer="https://astral.sh/uv/${UV_VERSION}/install.sh"
+            fi
+            curl -LsSf "$installer" | env UV_INSTALL_DIR="$HOME/.local/bin" sh
+            # $BASH_ENV is CircleCI's analogue of GitHub's $GITHUB_PATH: it is
+            # sourced at the start of every subsequent step.
+            {
+              echo 'export PATH="$HOME/.local/bin:$PATH"'
+              echo 'export UV_CACHE_DIR=/tmp/uv-cache'
+            } >> "$BASH_ENV"
+            # shellcheck disable=SC1090
+            . "$BASH_ENV"
+            uv --version
+
+  create-venv:
+    description: >
+      Replaces the actions/setup-python + `uv venv .venv` pair. uv provisions
+      the interpreter itself, so the executor image does not need to carry every
+      Python version in the matrix.
+    parameters:
+      python-version:
+        type: string
+    steps:
+      - run:
+          name: Create and activate virtual environment (Python << parameters.python-version >>)
+          environment:
+            PY_VERSION: << parameters.python-version >>
+          command: |
+            uv venv .venv --python "$PY_VERSION"
+            echo "export PATH=\"$PWD/.venv/bin:\$PATH\"" >> "$BASH_ENV"
+            .venv/bin/python --version
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+jobs:
+  # --- run_tests.yml: workflow-lint -----------------------------------------
+  workflow-lint:
+    description: >
+      Ported from run_tests.yml `workflow-lint`. zizmor and actionlint are
+      installed directly instead of via zizmorcore/zizmor-action and
+      raven-actions/actionlint. The actions' SARIF upload to GitHub code
+      scanning has no CircleCI equivalent; the SARIF is stored as an artifact.
+    docker:
+      - image: cimg/base:current
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: Install shellcheck
+          command: |
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends shellcheck
+      - install-uv
+      - run:
+          name: Install zizmor and actionlint
+          command: |
+            # install-uv already put $HOME/.local/bin on PATH via $BASH_ENV, and
+            # that is where `uv tool install` and the actionlint installer both
+            # land, so no sudo and no extra PATH plumbing is needed.
+            uv tool install zizmor
+            # Upstream's documented installer. "latest" matches
+            # raven-actions/actionlint's default of tracking the newest release.
+            curl -sSfL \
+              https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+              | bash -s -- latest "$HOME/.local/bin"
+            zizmor --version
+            actionlint --version
+      - run:
+          name: Run zizmor
+          command: |
+            mkdir -p /tmp/artifacts
+            status=0
+            zizmor --format sarif .github/workflows > /tmp/artifacts/zizmor.sarif || status=$?
+            echo "$status" > /tmp/artifacts/zizmor.status
+            # Re-run for a human-readable log; the gate step below decides.
+            zizmor .github/workflows || true
+      # store_artifacts must precede the gate step, otherwise a non-zero gate
+      # ends the job before the SARIF is uploaded.
+      - store_artifacts:
+          path: /tmp/artifacts
+          destination: workflow-lint
+          when: always
+      - run:
+          name: Fail if zizmor reported findings
+          command: |
+            status="$(cat /tmp/artifacts/zizmor.status)"
+            if [ "$status" -ne 0 ]; then
+              echo "zizmor exited with status $status"
+              exit "$status"
+            fi
+      - run:
+          name: Run actionlint
+          command: actionlint -color
+
+  # --- run_tests.yml: fix ---------------------------------------------------
+  ruff-fix-check:
+    description: Ported from run_tests.yml `fix` (name "Check Ruff Fix").
+    docker:
+      - image: cimg/base:current
+    resource_class: small
+    steps:
+      - checkout
+      - install-uv
+      - restore_cache:
+          keys:
+            - uv-v1-py3.11-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+            - uv-v1-py3.11-
+      - create-venv:
+          python-version: "3.11"
+      - run:
+          name: Install dependencies
+          command: uv sync --dev -p .venv --extra dev
+      - save_cache:
+          key: uv-v1-py3.11-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+          paths:
+            - /tmp/uv-cache
+      - run:
+          name: Ruff Check
+          command: |
+            ruff check --fix-only --diff --exit-non-zero-on-fix || (
+              echo ""
+              echo "❌ Ruff found issues that can be fixed automatically."
+              echo "💡 To fix them locally, run:"
+              echo ""
+              echo "    pre-commit run --all-files"
+              echo ""
+              echo "Then commit and push the changes."
+              exit 1
+            )
+
+  # --- run_tests.yml: test --------------------------------------------------
+  test:
+    description: Ported from run_tests.yml `test`; the GitHub matrix becomes a CircleCI matrix.
+    parameters:
+      python-version:
+        type: string
+    docker:
+      - image: cimg/base:current
+    # ubuntu-latest runners are 4 vCPU and `pytest -n auto` sizes itself from
+    # the core count, so `large` (4 vCPU) is the closest CircleCI class.
+    resource_class: large
+    steps:
+      - checkout
+      - install-uv
+      - restore_cache:
+          keys:
+            - uv-v1-py<< parameters.python-version >>-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+            - uv-v1-py<< parameters.python-version >>-
+      - create-venv:
+          python-version: << parameters.python-version >>
+      - run:
+          name: Install dependencies
+          command: |
+            uv sync --dev -p .venv --extra dev
+            uv pip list
+      - save_cache:
+          key: uv-v1-py<< parameters.python-version >>-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+          paths:
+            - /tmp/uv-cache
+      - run:
+          name: Run tests with pytest
+          command: uv run -p .venv pytest -vv -m 'not extra and not deno' -n auto --dist worksteal tests/
+
+  # --- run_tests.yml: extra_test -------------------------------------------
+  extra-test:
+    description: Ported from run_tests.yml `extra_test` (name "Run Extra and Deno Tests").
+    parameters:
+      python-version:
+        type: string
+    docker:
+      - image: cimg/base:current
+    resource_class: large
+    steps:
+      - checkout
+      - install-uv
+      - restore_cache:
+          keys:
+            - uv-extra-v1-py<< parameters.python-version >>-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+            - uv-extra-v1-py<< parameters.python-version >>-
+      - create-venv:
+          python-version: << parameters.python-version >>
+      - run:
+          name: Install dependencies
+          command: |
+            uv sync -p .venv --extra deno --extra dev --extra test_extras
+            uv run -p .venv python -c 'import deno, subprocess; subprocess.run([deno.find_deno_bin(), "--version"], check=True)'
+      - save_cache:
+          key: uv-extra-v1-py<< parameters.python-version >>-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+          paths:
+            - /tmp/uv-cache
+      - run:
+          name: Run extra and deno tests
+          command: uv run -p .venv pytest tests/ -m 'extra or deno' --extra --deno -n auto --dist worksteal
+
+  # --- run_tests.yml: mcp_v2_test ------------------------------------------
+  mcp-v2-test:
+    description: Ported from run_tests.yml `mcp_v2_test`.
+    docker:
+      - image: cimg/base:current
+    resource_class: medium
+    steps:
+      - checkout
+      - install-uv
+      - restore_cache:
+          keys:
+            - uv-mcp2-v1-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+            - uv-mcp2-v1-
+      - create-venv:
+          python-version: "3.11"
+      - run:
+          name: Install dependencies with MCP v2
+          command: |
+            uv sync -p .venv --extra dev
+            uv pip install -p .venv "mcp==2.0.0"
+      - save_cache:
+          key: uv-mcp2-v1-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+          paths:
+            - /tmp/uv-cache
+      - run:
+          name: Run MCP tests
+          command: uv run --frozen --no-sync -p .venv pytest tests/utils/test_mcp.py -m extra --extra
+
+  # --- run_tests.yml: llm_call_test ----------------------------------------
+  llm-call-test:
+    description: >
+      Ported from run_tests.yml `llm_call_test`. Uses the `machine` executor
+      rather than `docker` + setup_remote_docker: the job publishes Ollama on
+      localhost:11434 and needs `docker exec` into it, neither of which works
+      against CircleCI's remote Docker host.
+    machine:
+      image: ubuntu-2404:current
+    resource_class: large
+    environment:
+      # GitHub's $RUNNER_TEMP has no CircleCI counterpart.
+      RUNNER_TEMP: /tmp/runner-temp
+    steps:
+      - checkout
+      - run:
+          name: Create temp directory
+          command: mkdir -p "$RUNNER_TEMP"
+      # `background: true` is the CircleCI equivalent of GitHub's `( ... ) &`.
+      - run:
+          name: Prefetch Ollama image
+          background: true
+          command: |
+            if docker pull ollama/ollama:0.31.2 > "$RUNNER_TEMP/ollama-pull.log" 2>&1; then
+              echo 0 > "$RUNNER_TEMP/ollama-pull.status"
+            else
+              echo "$?" > "$RUNNER_TEMP/ollama-pull.status"
+            fi
+      - install-uv
+      - restore_cache:
+          keys:
+            - uv-llm-v1-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+            - uv-llm-v1-
+      - create-venv:
+          python-version: "3.11"
+      - run:
+          name: Install dependencies
+          command: |
+            uv sync --dev -p .venv --extra dev
+            uv pip list
+      - save_cache:
+          key: uv-llm-v1-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+          paths:
+            - /tmp/uv-cache
+      # actions/cache key: ollama-llama3.2-3b-${{ runner.os }}-ollama0.31.2-v2
+      - restore_cache:
+          keys:
+            - ollama-llama3.2-3b-{{ arch }}-ollama0.31.2-v2
+      - run:
+          name: Start Ollama service
+          command: |
+            for _ in $(seq 1 120); do
+              [ -f "$RUNNER_TEMP/ollama-pull.status" ] && break
+              sleep 1
+            done
+            if [ ! -f "$RUNNER_TEMP/ollama-pull.status" ] || [ "$(cat "$RUNNER_TEMP/ollama-pull.status")" != 0 ]; then
+              cat "$RUNNER_TEMP/ollama-pull.log"
+              exit 1
+            fi
+            mkdir -p ollama-data
+            docker run -d --name ollama \
+              -p 11434:11434 \
+              -v "$PWD/ollama-data:/root/.ollama" \
+              ollama/ollama:0.31.2
+            # Some runners are Sapphire-Rapids-class machines with AMX. llama.cpp's
+            # AMX-repacked weight path segfaults there during model load (llama-server
+            # dies with SIGSEGV in warm-up), while all non-AMX runners pass. Removing
+            # the AMX backend variant makes ggml's autodetection fall back to the
+            # icelake kernels that every other runner already uses.
+            docker exec ollama rm /usr/lib/ollama/libggml-cpu-sapphirerapids.so
+            timeout 60 bash -c 'until curl -f http://localhost:11434/api/version; do sleep 2; done'
+      - run:
+          name: Pull LLM
+          # GitHub gates this on `steps.cache-ollama.outputs.cache-hit != 'true'`.
+          # CircleCI's restore_cache exposes no hit/miss output, so the presence
+          # of the model in the restored volume is used instead. `ollama pull`
+          # is idempotent, so a false negative only costs time.
+          command: |
+            if docker exec ollama ollama list | grep -q 'llama3.2:3b'; then
+              echo "llama3.2:3b already present in restored cache; skipping pull."
+            else
+              docker exec ollama ollama pull llama3.2:3b
+            fi
+      - run:
+          name: Warm up LLM
+          command: |
+            for i in 1 2 3; do
+              if curl -fsS http://localhost:11434/api/generate \
+                -d '{"model":"llama3.2:3b","prompt":"ping","stream":false}'; then
+                echo "Ollama warm-up succeeded"
+                exit 0
+              fi
+              echo "Warm-up attempt $i failed; retrying..."
+              sleep 5
+            done
+            echo "Ollama failed to serve llama3.2:3b after 3 attempts"
+            docker logs ollama || true
+            exit 1
+      - run:
+          name: Set LM environment variable
+          # GitHub's `>> $GITHUB_ENV`; CircleCI's equivalent is $BASH_ENV.
+          command: echo 'export LM_FOR_TEST=ollama/llama3.2:3b' >> "$BASH_ENV"
+      - run:
+          name: Run tests
+          command: uv run -p .venv pytest -m llm_call --llm_call -vv --durations=5 tests/
+      # `if: always()` -> `when: always`. Must run before save_cache, which
+      # cannot read root-owned files written by the container.
+      - run:
+          name: Fix permissions for cache
+          when: always
+          # GitHub's script used "$USER", which GitHub Actions always exports.
+          # CircleCI does not guarantee it, and `chown -R :` would silently no-op
+          # behind the `|| true`, leaving root-owned files that save_cache cannot
+          # read. id(1) is unconditional.
+          command: sudo chown -R "$(id -un):$(id -gn)" ollama-data || true
+      - save_cache:
+          # actions/cache saves in a post-step, which runs even when the job has
+          # failed. CircleCI skips later steps after a failure unless told
+          # otherwise, so without `when: always` a failing test run would throw
+          # away a freshly pulled model.
+          when: always
+          key: ollama-llama3.2-3b-{{ arch }}-ollama0.31.2-v2
+          paths:
+            - ollama-data
+      - run:
+          name: Stop Ollama service
+          when: always
+          command: docker stop ollama && docker rm ollama
+
+  # --- run_tests.yml: build_package ----------------------------------------
+  build-package:
+    description: Ported from run_tests.yml `build_package`.
+    parameters:
+      python-version:
+        type: string
+    docker:
+      - image: cimg/base:current
+    resource_class: medium
+    steps:
+      - checkout
+      - install-uv
+      - restore_cache:
+          keys:
+            - uv-build-v1-py<< parameters.python-version >>-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+            - uv-build-v1-py<< parameters.python-version >>-
+      - create-venv:
+          python-version: << parameters.python-version >>
+      - run:
+          name: Build
+          # GitHub's actions/setup-python made the matrix interpreter the default
+          # before `uv build` ran, so the build was exercised on each version.
+          # uv has no such ambient state, so the interpreter is named explicitly
+          # -- otherwise every matrix instance would build with the same Python
+          # and the matrix would test nothing.
+          command: uv build --python .venv/bin/python
+      - save_cache:
+          key: uv-build-v1-py<< parameters.python-version >>-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+          paths:
+            - /tmp/uv-cache
+      - store_artifacts:
+          path: dist
+          destination: dist-py<< parameters.python-version >>
+      - run:
+          name: Install built package
+          command: uv pip install dist/*.whl -p .venv
+      - run:
+          name: Test import dspy
+          command: .venv/bin/python -c "import dspy"
+
+  # --- dependency-range.yml: dependency-range ------------------------------
+  dependency-range:
+    description: >
+      Ported from dependency-range.yml. GitHub's $GITHUB_STEP_SUMMARY has no
+      CircleCI equivalent; the same markdown is written to a file and stored as
+      a build artifact instead.
+    parameters:
+      profile:
+        type: string
+      resolution:
+        type: string
+    docker:
+      - image: cimg/base:current
+    resource_class: large
+    environment:
+      RUNNER_TEMP: /tmp/runner-temp
+    steps:
+      - checkout
+      - run:
+          name: Create temp and artifact directories
+          command: mkdir -p "$RUNNER_TEMP" /tmp/artifacts
+      - install-uv:
+          version: "0.11.2"
+      # The action's cache-dependency-glob here is `pyproject.toml` only -- no
+      # uv.lock -- because this job deliberately re-resolves from scratch.
+      - restore_cache:
+          keys:
+            - uv-deps-v1-<< parameters.profile >>-{{ checksum "pyproject.toml" }}
+            - uv-deps-v1-<< parameters.profile >>-
+      - run:
+          name: Create environment
+          command: uv venv .venv
+      - run:
+          name: Resolve << parameters.profile >> dependencies
+          environment:
+            PROFILE: << parameters.profile >>
+            RESOLUTION: << parameters.resolution >>
+          command: |
+            uv pip compile pyproject.toml \
+              --extra deno \
+              --extra dev \
+              --extra test_extras \
+              --resolution "$RESOLUTION" \
+              --python .venv/bin/python \
+              --refresh \
+              --no-sources \
+              --output-file "$RUNNER_TEMP/requirements-$PROFILE.txt"
+
+            uv pip sync \
+              --strict \
+              --python .venv/bin/python \
+              "$RUNNER_TEMP/requirements-$PROFILE.txt"
+
+            uv pip install \
+              --python .venv/bin/python \
+              --no-deps \
+              --editable .
+
+            uv pip check --python .venv/bin/python
+            uv pip list --python .venv/bin/python
+            uv run --frozen --no-sync --python .venv/bin/python python -c \
+              'import deno, subprocess; subprocess.run([deno.find_deno_bin(), "--version"], check=True)'
+
+            cp "$RUNNER_TEMP/requirements-$PROFILE.txt" /tmp/artifacts/
+      - save_cache:
+          key: uv-deps-v1-<< parameters.profile >>-{{ checksum "pyproject.toml" }}
+          paths:
+            - /tmp/uv-cache
+      - run:
+          name: Run non-live tests
+          environment:
+            PROFILE: << parameters.profile >>
+          # Deliberately exits 0: the pass/fail decision is deferred to the gate
+          # step below so that the summary and log artifacts are stored first.
+          command: |
+            set +e
+            uv run --frozen --no-sync pytest -q -n auto --dist worksteal tests/ --extra --deno 2>&1 \
+              | tee "$RUNNER_TEMP/pytest-$PROFILE.log"
+            TEST_STATUS=${PIPESTATUS[0]}
+            set -e
+
+            {
+              echo "## Dependencies ($PROFILE)"
+              echo
+              if [ "$TEST_STATUS" -eq 0 ]; then
+                echo "✅ Non-live test suite passed."
+              else
+                echo "❌ Non-live test suite failed."
+                echo
+                echo '```text'
+                if ! grep -E '^(FAILED|ERROR) |[0-9]+ failed, [0-9]+ passed' "$RUNNER_TEMP/pytest-$PROFILE.log"; then
+                  tail -n 20 "$RUNNER_TEMP/pytest-$PROFILE.log"
+                fi
+                echo '```'
+              fi
+            } > "/tmp/artifacts/summary-$PROFILE.md"
+
+            cp "$RUNNER_TEMP/pytest-$PROFILE.log" /tmp/artifacts/
+            cat "/tmp/artifacts/summary-$PROFILE.md"
+            echo "$TEST_STATUS" > "/tmp/artifacts/pytest-$PROFILE.status"
+      - store_artifacts:
+          path: /tmp/artifacts
+          destination: dependencies-<< parameters.profile >>
+          when: always
+      # Gate step: must be last, after the artifacts exist.
+      - run:
+          name: Fail if non-live tests failed
+          command: |
+            status="$(cat "/tmp/artifacts/pytest-<< parameters.profile >>.status")"
+            if [ "$status" -ne 0 ]; then
+              echo "pytest exited with status $status"
+              exit "$status"
+            fi
+
+  # --- docs-push.yml: build-test -------------------------------------------
+  docs-build:
+    description: >
+      Ported from docs-push.yml `build-test`. GitHub gates it on
+      `github.event_name == 'pull_request'`; here the `run-docs` pipeline
+      parameter carries both that gate and the `paths: docs/**` filter.
+    docker:
+      - image: cimg/python:3.11
+    resource_class: medium
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - docs-pip-v1-{{ checksum "docs/requirements.txt" }}
+            - docs-pip-v1-
+      - run:
+          name: Install dependencies and build
+          command: |
+            cd docs
+            pip install --cache-dir /tmp/pip-cache -r requirements.txt
+            mkdocs build
+      - save_cache:
+          key: docs-pip-v1-{{ checksum "docs/requirements.txt" }}
+          paths:
+            - /tmp/pip-cache
+      - store_artifacts:
+          path: docs/site
+          destination: docs-site
+
+  # --- precommits_check.yml: pre-commit-checks -----------------------------
+  pre-commit-checks:
+    description: >
+      Ported from precommits_check.yml. Two actions had to be reimplemented:
+      Slashgear/action-check-pr-title (CircleCI never sees the PR title) and
+      jitterbit/get-changed-files (CircleCI has no changed-file API).
+    parameters:
+      pr-title-regexp:
+        description: >
+          Verbatim `regexp` input from precommits_check.yml's
+          Slashgear/action-check-pr-title step. Evaluated with Python's `re`.
+        type: string
+        default: '(break|build|ci|docs|feat|fix|perf|refactor|style|test|ops|hotfix|release|maint|init|enh|revert)\([a-z,A-Z,0-9,\-,\_,\/,:]+\)(:)\s{1}([\w\s]+)'
+    docker:
+      - image: cimg/python:3.10
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Check Pull Request Title
+          environment:
+            TITLE_REGEXP: << parameters.pr-title-regexp >>
+          command: .circleci/scripts/pr-title-check.sh
+      - run:
+          name: Getting changed files list
+          environment:
+            BASE_REVISION: << pipeline.parameters.base-revision >>
+          command: |
+            .circleci/scripts/changed-files.sh "$BASE_REVISION" --existing \
+              > /tmp/changed-files.txt
+            echo "export CHANGED_FILES=\"$(tr '\n' ' ' < /tmp/changed-files.txt)\"" >> "$BASH_ENV"
+      - run:
+          name: Checking changed files
+          command: |
+            echo "Changed files"
+            echo "$CHANGED_FILES"
+            echo "Git client version"
+            git --version
+      - restore_cache:
+          keys:
+            - pre-commit-v1-{{ checksum ".pre-commit-config.yaml" }}
+            - pre-commit-v1-
+      - run:
+          name: Pre-Commit Checks
+          command: |
+            python -m pip install --upgrade pip
+            pip install pre-commit
+            echo "Running pre-commit scans:"
+            if [ -z "$CHANGED_FILES" ]; then
+              echo "No changed files to scan."
+              exit 0
+            fi
+            # adding log display in case of pre-commit errors
+            # shellcheck disable=SC2086
+            pre-commit run -v --files $CHANGED_FILES
+      - save_cache:
+          key: pre-commit-v1-{{ checksum ".pre-commit-config.yaml" }}
+          paths:
+            - ~/.cache/pre-commit
+
+# ---------------------------------------------------------------------------
+# Workflows
+# ---------------------------------------------------------------------------
+workflows:
+  # run_tests.yml
+  core:
+    when: << pipeline.parameters.run-core >>
+    jobs:
+      - workflow-lint
+      - ruff-fix-check
+      - test:
+          matrix:
+            parameters:
+              python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+      - extra-test:
+          matrix:
+            parameters:
+              python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+      - mcp-v2-test
+      - llm-call-test
+      - build-package:
+          matrix:
+            parameters:
+              python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+  # docs-push.yml (build-test only)
+  docs:
+    when: << pipeline.parameters.run-docs >>
+    jobs:
+      - docs-build
+
+  # dependency-range.yml. GitHub sets `fail-fast: false`; CircleCI matrix jobs
+  # are independent and never cancel one another, so this needs no counterpart.
+  dependencies:
+    when: << pipeline.parameters.run-deps >>
+    jobs:
+      - dependency-range:
+          matrix:
+            parameters:
+              profile: ["minimum-direct"]
+              resolution: ["lowest-direct"]
+          name: dependency-range-minimum-direct
+      - dependency-range:
+          matrix:
+            parameters:
+              profile: ["latest"]
+              resolution: ["highest"]
+          name: dependency-range-latest
+
+  # precommits_check.yml
+  pre-commit:
+    when: << pipeline.parameters.run-pre-commit >>
+    jobs:
+      - pre-commit-checks

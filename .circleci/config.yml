@@ -1,0 +1,73 @@
+# CircleCI setup (first-stage) config for dspy.
+#
+# Ported from .github/workflows/{run_tests,dependency-range,docs-push,precommits_check}.yml
+#
+# GitHub Actions decides *which workflows exist* from the trigger event and its
+# `paths:` filters. CircleCI starts one pipeline per push and evaluates the
+# whole config, so that decision has to happen inside the pipeline. This setup
+# stage computes boolean pipeline parameters from the changed path set and
+# continues into .circleci/continue-config.yml with them.
+#
+# Triggering the GitHub-only entry points:
+#   * `on.workflow_dispatch` for precommits_check.yml
+#         POST /api/v2/project/<slug>/pipeline
+#         {"branch": "<branch>", "parameters": {"run-pre-commit": true}}
+#   * `on.schedule: "17 9 * * 1"` for dependency-range.yml
+#         a CircleCI scheduled pipeline on `main` setting
+#         {"run-dependency-range": true}
+version: 2.1
+
+setup: true
+
+orbs:
+  continuation: circleci/continuation@1.1.0
+
+parameters:
+  # Replaces `on.workflow_dispatch` in precommits_check.yml.
+  run-pre-commit:
+    type: boolean
+    default: false
+  # Replaces `on.schedule` + `on.workflow_dispatch` in dependency-range.yml.
+  run-dependency-range:
+    type: boolean
+    default: false
+  # The branch pull requests are compared against, i.e. GitHub's base ref.
+  base-revision:
+    type: string
+    default: main
+
+jobs:
+  decide:
+    docker:
+      # cimg/base ships git, curl and jq, all of which the decide step and the
+      # continuation orb require.
+      - image: cimg/base:current
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: Create output directory
+          command: mkdir -p /tmp/setup
+      - run:
+          name: Emit pipeline parameters from changed paths
+          environment:
+            BASE_REVISION: << pipeline.parameters.base-revision >>
+            FORCE_PRE_COMMIT: << pipeline.parameters.run-pre-commit >>
+            FORCE_DEPENDENCY_RANGE: << pipeline.parameters.run-dependency-range >>
+          command: .circleci/scripts/emit-pipeline-parameters.sh /tmp/setup/pipeline-parameters.json
+      # A directory rather than the file: on a failed emit step the file may not
+      # exist, and store_artifacts on a missing path is an error.
+      - store_artifacts:
+          path: /tmp/setup
+          destination: setup
+          when: always
+      # Must be the last step: continuation/continue is `when: on_success` and
+      # posts the second-stage config, ending this stage.
+      - continuation/continue:
+          configuration_path: .circleci/continue-config.yml
+          parameters: /tmp/setup/pipeline-parameters.json
+
+workflows:
+  setup:
+    jobs:
+      - decide
