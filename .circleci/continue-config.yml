@@ -206,8 +206,14 @@ jobs:
         type: string
     docker:
       - image: cimg/base:current
-    # ubuntu-latest runners are 4 vCPU and `pytest -n auto` sizes itself from
-    # the core count, so `large` (4 vCPU) is the closest CircleCI class.
+    # ubuntu-latest runners are 4 vCPU, so `large` is the closest CircleCI class.
+    #
+    # The worker count is passed explicitly rather than left as `pytest -n auto`.
+    # `-n auto` sizes itself from the cores it can *see*, and a Docker executor
+    # sees the host's cores, not the container's allocation -- on this project it
+    # tried to start 36 workers on a 4-vCPU container and every test job was
+    # killed on memory exhaustion. Raising resource_class does not help; only an
+    # explicit count does.
     resource_class: large
     steps:
       - checkout
@@ -229,7 +235,7 @@ jobs:
             - /tmp/uv-cache
       - run:
           name: Run tests with pytest
-          command: uv run -p .venv pytest -vv -m 'not extra and not deno' -n auto --dist worksteal tests/
+          command: uv run -p .venv pytest -vv -m 'not extra and not deno' -n 4 --dist worksteal tests/
 
   # --- run_tests.yml: extra_test -------------------------------------------
   extra-test:
@@ -260,7 +266,7 @@ jobs:
             - /tmp/uv-cache
       - run:
           name: Run extra and deno tests
-          command: uv run -p .venv pytest tests/ -m 'extra or deno' --extra --deno -n auto --dist worksteal
+          command: uv run -p .venv pytest tests/ -m 'extra or deno' --extra --deno -n 4 --dist worksteal
 
   # --- run_tests.yml: mcp_v2_test ------------------------------------------
   mcp-v2-test:
@@ -535,7 +541,7 @@ jobs:
           # step below so that the summary and log artifacts are stored first.
           command: |
             set +e
-            uv run --frozen --no-sync pytest -q -n auto --dist worksteal tests/ --extra --deno 2>&1 \
+            uv run --frozen --no-sync pytest -q -n 4 --dist worksteal tests/ --extra --deno 2>&1 \
               | tee "$RUNNER_TEMP/pytest-$PROFILE.log"
             TEST_STATUS=${PIPESTATUS[0]}
             set -e
