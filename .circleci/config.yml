@@ -1,0 +1,115 @@
+version: 2.1
+
+# This pipeline needs no secrets to run: the default test suite (see
+# tests/conftest.py SKIP_DEFAULT_FLAGS) skips everything that would call a
+# real LLM, needs an API key, or needs the Deno binary. Nothing here talks to
+# a network service other than PyPI/uv's index and the CircleCI API.
+
+executors:
+  py310:
+    docker:
+      - image: cimg/python:3.10
+  py312:
+    docker:
+      - image: cimg/python:3.12
+  py314:
+    docker:
+      - image: cimg/python:3.14
+
+commands:
+  install_uv:
+    steps:
+      - run:
+          name: Install uv
+          command: |
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$BASH_ENV"
+
+  sync_deps:
+    parameters:
+      extras:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - uv-deps-v1-{{ .Environment.CIRCLE_JOB }}-{{ checksum "uv.lock" }}
+      - run:
+          name: Install dependencies (uv sync --frozen)
+          command: uv sync --frozen << parameters.extras >>
+      - save_cache:
+          key: uv-deps-v1-{{ .Environment.CIRCLE_JOB }}-{{ checksum "uv.lock" }}
+          paths:
+            - ~/.cache/uv
+
+jobs:
+  lint:
+    executor: py310
+    resource_class: medium
+    steps:
+      - checkout
+      - install_uv
+      - sync_deps:
+          extras: "--extra dev"
+      - run:
+          # Report-only: this repo's pre-commit hook only runs `ruff --fix-only`
+          # (never fails) and has no format hook at all, so lint/format have
+          # never been enforced here. These steps surface drift without
+          # failing the job on the existing backlog. Exit codes are discarded
+          # on purpose; do not make these blocking without first clearing the
+          # pre-existing findings (see PR description / CI setup notes).
+          name: ruff check (report-only, does not fail the build)
+          command: uv run ruff check . || true
+      - run:
+          name: ruff format --check (report-only, does not fail the build)
+          command: uv run ruff format --check . || true
+
+  test:
+    parameters:
+      executor-name:
+        type: string
+    executor: << parameters.executor-name >>
+    resource_class: medium
+    parallelism: 4
+    steps:
+      - checkout
+      - install_uv
+      - sync_deps:
+          extras: "--extra dev --extra test_extras"
+      - run:
+          name: Select this shard's test files (split by prior timing data)
+          command: |
+            circleci tests glob "tests/**/test_*.py" > /tmp/all-tests.txt
+            if [ ! -s /tmp/all-tests.txt ]; then
+              echo "circleci tests glob matched zero files - the glob pattern is broken" >&2
+              exit 1
+            fi
+            circleci tests split --split-by=timings --timings-type=filename \
+              < /tmp/all-tests.txt > /tmp/tests-to-run.txt
+            cat /tmp/tests-to-run.txt
+      - run:
+          name: Run pytest
+          # Base default-flag skip list (reliability/extra/llm_call/deno) means
+          # nothing here needs API keys or the Deno binary.
+          command: |
+            mkdir -p test-results
+            if [ ! -s /tmp/tests-to-run.txt ]; then
+              echo "No test files assigned to this shard, nothing to run."
+              exit 0
+            fi
+            uv run pytest $(cat /tmp/tests-to-run.txt) \
+              --junitxml=test-results/junit.xml \
+              -v
+          no_output_timeout: 15m
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+
+workflows:
+  build-and-test:
+    jobs:
+      - lint
+      - test:
+          matrix:
+            parameters:
+              executor-name: [py310, py312, py314]
