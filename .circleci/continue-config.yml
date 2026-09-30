@@ -99,6 +99,16 @@ commands:
             echo "export PATH=\"$PWD/.venv/bin:\$PATH\"" >> "$BASH_ENV"
             .venv/bin/python --version
 
+  prune-uv-cache:
+    description: >
+      Run immediately before save_cache. `--ci` drops pre-built wheels (cheap to
+      re-download) and keeps wheels built from source, which keeps the saved
+      cache small so restore time does not cancel out the benefit.
+    steps:
+      - run:
+          name: Prune uv cache
+          command: uv cache prune --ci
+
 # ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
@@ -180,6 +190,7 @@ jobs:
       - run:
           name: Install dependencies
           command: uv sync --dev -p .venv --extra dev
+      - prune-uv-cache
       - save_cache:
           key: uv-v1-py3.11-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
           paths:
@@ -229,13 +240,17 @@ jobs:
           command: |
             uv sync --dev -p .venv --extra dev
             uv pip list
+      - prune-uv-cache
       - save_cache:
           key: uv-v1-py<< parameters.python-version >>-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
           paths:
             - /tmp/uv-cache
       - run:
           name: Run tests with pytest
-          command: uv run -p .venv pytest -vv -m 'not extra and not deno' -n 4 --dist worksteal tests/
+          command: uv run -p .venv pytest -vv -m 'not extra and not deno' -n 4 --dist worksteal --junitxml=/tmp/test-results/junit.xml -o junit_family=xunit1 tests/
+      - store_test_results:
+          path: /tmp/test-results
+          when: always
 
   # --- run_tests.yml: extra_test -------------------------------------------
   extra-test:
@@ -260,13 +275,17 @@ jobs:
           command: |
             uv sync -p .venv --extra deno --extra dev --extra test_extras
             uv run -p .venv python -c 'import deno, subprocess; subprocess.run([deno.find_deno_bin(), "--version"], check=True)'
+      - prune-uv-cache
       - save_cache:
           key: uv-extra-v1-py<< parameters.python-version >>-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
           paths:
             - /tmp/uv-cache
       - run:
           name: Run extra and deno tests
-          command: uv run -p .venv pytest tests/ -m 'extra or deno' --extra --deno -n 4 --dist worksteal
+          command: uv run -p .venv pytest tests/ -m 'extra or deno' --extra --deno -n 4 --dist worksteal --junitxml=/tmp/test-results/junit.xml -o junit_family=xunit1
+      - store_test_results:
+          path: /tmp/test-results
+          when: always
 
   # --- run_tests.yml: mcp_v2_test ------------------------------------------
   mcp-v2-test:
@@ -288,13 +307,17 @@ jobs:
           command: |
             uv sync -p .venv --extra dev
             uv pip install -p .venv "mcp==2.0.0"
+      - prune-uv-cache
       - save_cache:
           key: uv-mcp2-v1-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
           paths:
             - /tmp/uv-cache
       - run:
           name: Run MCP tests
-          command: uv run --frozen --no-sync -p .venv pytest tests/utils/test_mcp.py -m extra --extra
+          command: uv run --frozen --no-sync -p .venv pytest tests/utils/test_mcp.py -m extra --extra --junitxml=/tmp/test-results/junit.xml -o junit_family=xunit1
+      - store_test_results:
+          path: /tmp/test-results
+          when: always
 
   # --- run_tests.yml: llm_call_test ----------------------------------------
   llm-call-test:
@@ -336,6 +359,7 @@ jobs:
           command: |
             uv sync --dev -p .venv --extra dev
             uv pip list
+      - prune-uv-cache
       - save_cache:
           key: uv-llm-v1-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
           paths:
@@ -400,7 +424,10 @@ jobs:
           command: echo 'export LM_FOR_TEST=ollama/llama3.2:3b' >> "$BASH_ENV"
       - run:
           name: Run tests
-          command: uv run -p .venv pytest -m llm_call --llm_call -vv --durations=5 tests/
+          command: uv run -p .venv pytest -m llm_call --llm_call -vv --durations=5 --junitxml=/tmp/test-results/junit.xml -o junit_family=xunit1 tests/
+      - store_test_results:
+          path: /tmp/test-results
+          when: always
       # `if: always()` -> `when: always`. Must run before save_cache, which
       # cannot read root-owned files written by the container.
       - run:
@@ -451,6 +478,7 @@ jobs:
           # -- otherwise every matrix instance would build with the same Python
           # and the matrix would test nothing.
           command: uv build --python .venv/bin/python
+      - prune-uv-cache
       - save_cache:
           key: uv-build-v1-py<< parameters.python-version >>-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
           paths:
@@ -529,6 +557,7 @@ jobs:
               'import deno, subprocess; subprocess.run([deno.find_deno_bin(), "--version"], check=True)'
 
             cp "$RUNNER_TEMP/requirements-$PROFILE.txt" /tmp/artifacts/
+      - prune-uv-cache
       - save_cache:
           key: uv-deps-v1-<< parameters.profile >>-{{ checksum "pyproject.toml" }}
           paths:
@@ -541,7 +570,7 @@ jobs:
           # step below so that the summary and log artifacts are stored first.
           command: |
             set +e
-            uv run --frozen --no-sync pytest -q -n 4 --dist worksteal tests/ --extra --deno 2>&1 \
+            uv run --frozen --no-sync pytest -q -n 4 --dist worksteal --junitxml=/tmp/test-results/junit.xml -o junit_family=xunit1 tests/ --extra --deno 2>&1 \
               | tee "$RUNNER_TEMP/pytest-$PROFILE.log"
             TEST_STATUS=${PIPESTATUS[0]}
             set -e
@@ -565,6 +594,9 @@ jobs:
             cp "$RUNNER_TEMP/pytest-$PROFILE.log" /tmp/artifacts/
             cat "/tmp/artifacts/summary-$PROFILE.md"
             echo "$TEST_STATUS" > "/tmp/artifacts/pytest-$PROFILE.status"
+      - store_test_results:
+          path: /tmp/test-results
+          when: always
       - store_artifacts:
           path: /tmp/artifacts
           destination: dependencies-<< parameters.profile >>
