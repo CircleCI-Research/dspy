@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
 
+import httpx
 import litellm
 import pydantic
 import pytest
@@ -278,9 +279,11 @@ def test_lm_calls_support_pydantic_models(litellm_test_server):
 
 def test_lm_wraps_litellm_errors_with_metadata():
     lm = dspy.LM("openai/gpt-4o-mini")
-    response = mock.Mock()
-    response.status_code = 429
-    response.headers = {"x-request-id": "req-123", "retry-after": "2.5"}
+    response = httpx.Response(
+        429,
+        headers={"x-request-id": "req-123", "retry-after": "2.5"},
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+    )
 
     error = litellm.RateLimitError(message="too many requests", llm_provider="openai", model="gpt-4o", response=response)
     wrapped = lm._wrap_litellm_exception(error)
@@ -352,9 +355,7 @@ def test_retry_made_on_system_errors():
     def mock_create(*args, **kwargs):
         retry_tracking[0] += 1
         # These fields are called during the error handling
-        mock_response = mock.Mock()
-        mock_response.headers = {}
-        mock_response.status_code = 429
+        mock_response = httpx.Response(429, request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"))
         raise RateLimitError(response=mock_response, message="message", body="error")
 
     original_retrying = tenacity.Retrying
@@ -406,7 +407,7 @@ def test_reasoning_model_token_parameter():
 
 
 def test_lm_supports_reasoning_with_litellm_capability_api():
-    lm = dspy.LM("anthropic/claude-3-7-sonnet-20250219")
+    lm = dspy.LM("anthropic/claude-sonnet-4-5-20250929")
     assert lm.supports_reasoning is True
 
 
@@ -1022,9 +1023,7 @@ def test_exponential_backoff_retry():
 
     def mock_create(*args, **kwargs):
         # These fields are called during the error handling
-        mock_response = mock.Mock()
-        mock_response.headers = {}
-        mock_response.status_code = 429
+        mock_response = httpx.Response(429, request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"))
         raise RateLimitError(response=mock_response, message="message", body="error")
 
     original_retrying = tenacity.Retrying

@@ -1588,10 +1588,10 @@ def test_json_adapter_native_reasoning():
                     ),
                 )
             ],
-            model="anthropic/claude-3-7-sonnet-20250219",
+            model="anthropic/claude-sonnet-4-5-20250929",
         )
         modified_signature = adapter._call_preprocess(
-            dspy.LM(model="anthropic/claude-3-7-sonnet-20250219", reasoning_effort="low", cache=False),
+            dspy.LM(model="anthropic/claude-sonnet-4-5-20250929", reasoning_effort="low", cache=False),
             {},
             MySignature,
             {"question": "What is the capital of France?"},
@@ -1599,7 +1599,7 @@ def test_json_adapter_native_reasoning():
         assert "reasoning" not in modified_signature.output_fields
 
         result = adapter(
-            dspy.LM(model="anthropic/claude-3-7-sonnet-20250219", reasoning_effort="low", cache=False),
+            dspy.LM(model="anthropic/claude-sonnet-4-5-20250929", reasoning_effort="low", cache=False),
             {},
             MySignature,
             [],
